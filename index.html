@@ -63,8 +63,8 @@
   </div>
   <label id="modelrow">Model:
     <select id="model">
-      <option value="onnx-community/whisper-large-v3-turbo">large-v3-turbo (nejpřesnější, ~560 MB, WebGPU)</option>
-      <option value="onnx-community/whisper-small">small (~250 MB)</option>
+      <option value="onnx-community/whisper-small">small (doporučený, ~250 MB)</option>
+      <option value="onnx-community/whisper-large-v3-turbo">large-v3-turbo (nejpřesnější, ~560 MB, chce silné GPU)</option>
       <option value="onnx-community/whisper-base">base (rychlý, méně přesný)</option>
     </select>
   </label>
@@ -146,7 +146,13 @@ const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&
 const status = (t) => ($('status').textContent = t);
 
 const modelSel = $('model');
-modelSel.value = localStorage.getItem('aimodel') || (navigator.gpu ? 'onnx-community/whisper-large-v3-turbo' : 'onnx-community/whisper-small');
+// A tab crash leaves the loading flag set; fall back to the safe model instead of crashing again.
+const crashed = localStorage.getItem('aimodel_loading');
+if (crashed) {
+  localStorage.removeItem('aimodel_loading');
+  localStorage.setItem('aimodel', 'onnx-community/whisper-small');
+}
+modelSel.value = localStorage.getItem('aimodel') || 'onnx-community/whisper-small';
 modelSel.onchange = () => { localStorage.setItem('aimodel', modelSel.value); asr = null; };
 
 async function loadModel() {
@@ -158,6 +164,7 @@ async function loadModel() {
   const dtype = !gpu ? 'q8'
     : turbo ? (f16 ? { encoder_model: 'q4f16', decoder_model_merged: 'q4f16' } : { encoder_model: 'q4', decoder_model_merged: 'q4' })
     : { encoder_model: f16 ? 'fp16' : 'fp32', decoder_model_merged: 'q4' };
+  localStorage.setItem('aimodel_loading', modelSel.value);
   status('Stahuji model (jednou, pak je v cache)…');
   asr = await pipeline('automatic-speech-recognition', modelSel.value, {
     device: gpu ? 'webgpu' : 'wasm',
@@ -181,6 +188,7 @@ async function drain() {
     const audio = queue.shift();
     status(`Přepisuji… (fronta ${queue.length})`);
     const { text } = await asr(audio, { language: 'czech', task: 'transcribe' });
+    localStorage.removeItem('aimodel_loading');
     const t = text.trim();
     if (!t) continue;
     const n = (t.match(RE) || []).length;
@@ -252,6 +260,7 @@ $('toggle').onclick = () => (running ? stop() : start());
 $('plus').onclick = () => hit(1);
 $('reset').onclick = () => { count = 0; combo = 0; maxCombo = 0; localStorage.setItem('aimaxcombo', 0); $('combo').textContent = ''; render(); };
 render();
+if (crashed) status('Předchozí model shodil záložku, přepnuto na small.');
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
 </script>
