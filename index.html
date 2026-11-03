@@ -13,7 +13,7 @@
   body { margin:0; min-height:100dvh; background:var(--bg); color:var(--fg);
     font-family: system-ui, -apple-system, sans-serif; display:flex; flex-direction:column;
     align-items:center; justify-content:center; gap:24px; padding:16px; text-align:center; }
-  #count { font-size: clamp(120px, 40vw, 320px); font-weight:800; line-height:1;
+  #count { font-size: clamp(80px, 25vw, 200px); font-weight:800; line-height:1;
     font-variant-numeric: tabular-nums; transition: transform .15s, color .15s; }
   #count.bump { transform: scale(1.15); color: var(--hot); }
   .label { color:var(--mute); letter-spacing:.2em; text-transform:uppercase; font-size:14px; }
@@ -24,11 +24,35 @@
   #live { min-height:3em; max-width:640px; color:var(--mute); font-size:16px; }
   #status { font-size:13px; color:var(--mute); }
   mark { background:var(--hot); color:#000; border-radius:4px; padding:0 3px; }
+  /* Pub-style beer mat tally: groups of five, fifth stroke crosses the four. */
+  #tally { width:min(92vw,420px); aspect-ratio:1; border-radius:50%; background:#f3ead8; color:#222;
+    display:flex; flex-wrap:wrap; align-content:center; justify-content:center; gap:6px 14px; padding:18% 14%;
+    box-shadow: inset 0 0 0 10px #e2d4b7, 0 10px 30px #0008; transform: rotate(-3deg); }
+  .g { position:relative; display:inline-flex; gap:5px; height:30px; }
+  .g i { width:3px; height:100%; background:#222; border-radius:2px; transform: rotate(4deg); }
+  .g.full::after { content:""; position:absolute; left:-4px; right:-4px; top:50%; height:3px; background:#b00;
+    transform: rotate(-25deg); border-radius:2px; }
+  .more { font: 700 18px/30px system-ui; color:#b00; }
+  #combo { min-height:1.4em; font-size:28px; font-weight:900; color:var(--hot); letter-spacing:.05em;
+    text-shadow: 0 0 18px var(--hot); }
+  #combo.pop { animation: pop .35s; }
+  @keyframes pop { 0% { transform:scale(.6) } 60% { transform:scale(1.3) } 100% { transform:scale(1) } }
+  body.shake { animation: shake .4s; }
+  @keyframes shake { 25% { transform:translate(-6px,3px) } 50% { transform:translate(5px,-4px) } 75% { transform:translate(-3px,2px) } }
+  #toast { position:fixed; bottom:24px; left:16px; right:16px; margin:auto; max-width:480px; padding:14px 18px;
+    border-radius:14px; background:#16161d; border:1px solid var(--accent); opacity:0; transition:opacity .3s;
+    pointer-events:none; }
+  #toast.on { opacity:1; }
+  #stats { font-size:13px; color:var(--mute); }
 </style>
 </head>
 <body>
   <div class="label">Zmínek „AI"</div>
   <div id="count" aria-live="polite">0</div>
+  <div id="combo" aria-live="polite"></div>
+  <div id="tally" aria-hidden="true"></div>
+  <div id="stats"></div>
+  <div id="toast" role="status"></div>
   <div class="row">
     <button id="toggle" class="primary">Start</button>
     <button id="plus" aria-label="Přičíst ručně">+1</button>
@@ -48,10 +72,65 @@ let count = +localStorage.getItem('aicount') || 0;
 let running = false, asr = null, ctx = null, stream = null, wakeLock = null;
 let buf = [], busy = false, queue = [];
 
+const COMBO_WINDOW_MS = 20000, TALLY_MAX = 60;
+const COMBO_NAMES = ['', '', 'DOUBLE AI!', 'TRIPLE AI!', 'BUZZWORD OVERDRIVE', 'SYNERGIE!', 'DISRUPCE!',
+  'PITCH DECK MODE', 'GAME CHANGER', 'PARADIGM SHIFT', 'INVESTOR READY'];
+const MILESTONES = {
+  5: 'Pět čárek, první tácek. Hospodský už ví.',
+  10: 'Deset. Někdo už v duchu píše LinkedIn post.',
+  25: 'Čtvrtstovka. Tohle už je strategie, ne zmínka.',
+  42: 'Odpověď na všechno je zřejmě AI.',
+  50: 'Padesát. Doporučujeme přejmenovat firmu na *.ai',
+  69: 'Nice.',
+  100: 'Stovka. Gratulujeme, jste oficiálně AI-first.',
+};
+let combo = 0, maxCombo = +localStorage.getItem('aimaxcombo') || 0, lastHit = 0, comboTimer;
+
+function toast(msg) {
+  $('toast').textContent = msg;
+  $('toast').classList.add('on');
+  setTimeout(() => $('toast').classList.remove('on'), 4000);
+}
+
+function renderTally() {
+  const shown = Math.min(count, TALLY_MAX);
+  let html = '';
+  for (let g = 0; g < shown; g += 5) {
+    const n = Math.min(5, shown - g);
+    html += `<span class="g${n === 5 ? ' full' : ''}">${'<i></i>'.repeat(Math.min(n, 4))}</span>`;
+  }
+  if (count > TALLY_MAX) html += `<span class="more">+${count - TALLY_MAX} (nový tácek)</span>`;
+  $('tally').innerHTML = html;
+}
+
 function render(bump) {
   $('count').textContent = count;
   localStorage.setItem('aicount', count);
+  renderTally();
+  $('stats').textContent = maxCombo > 1 ? `Nejvyšší combo: x${maxCombo}` : '';
   if (bump) { $('count').classList.add('bump'); setTimeout(() => $('count').classList.remove('bump'), 200); }
+}
+
+function hit(n) {
+  const now = Date.now();
+  const before = count;
+  combo = now - lastHit < COMBO_WINDOW_MS ? combo + n : n;
+  lastHit = now;
+  count += n;
+  if (combo > maxCombo) { maxCombo = combo; localStorage.setItem('aimaxcombo', maxCombo); }
+  render(true);
+
+  if (combo > 1) {
+    const el = $('combo');
+    el.textContent = `x${combo} ${COMBO_NAMES[Math.min(combo, COMBO_NAMES.length - 1)]}`;
+    el.classList.remove('pop'); void el.offsetWidth; el.classList.add('pop');
+    if (combo >= 3) { document.body.classList.add('shake'); setTimeout(() => document.body.classList.remove('shake'), 400); }
+    navigator.vibrate?.(combo >= 3 ? [60, 40, 60] : 40);
+  }
+  clearTimeout(comboTimer);
+  comboTimer = setTimeout(() => { $('combo').textContent = ''; combo = 0; }, COMBO_WINDOW_MS);
+
+  for (const m of Object.keys(MILESTONES)) if (before < m && count >= m) toast(MILESTONES[m]);
 }
 const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[c]));
 const status = (t) => ($('status').textContent = t);
@@ -76,7 +155,7 @@ async function drain() {
     const audio = queue.length > 2 ? queue.splice(0).pop() : queue.shift();
     const { text } = await asr(audio, { language: 'czech', task: 'transcribe' });
     const n = (text.match(RE) || []).length;
-    if (n) { count += n; render(true); }
+    if (n) hit(n);
     $('live').innerHTML = esc(text).replace(RE, '<mark>$&</mark>');
   }
   busy = false;
@@ -133,8 +212,8 @@ function stop() {
 }
 
 $('toggle').onclick = () => (running ? stop() : start());
-$('plus').onclick = () => { count++; render(true); };
-$('reset').onclick = () => { count = 0; render(); };
+$('plus').onclick = () => hit(1);
+$('reset').onclick = () => { count = 0; combo = 0; maxCombo = 0; localStorage.setItem('aimaxcombo', 0); $('combo').textContent = ''; render(); };
 render();
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
