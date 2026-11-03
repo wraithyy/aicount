@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AI Count</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0b0b0f">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<style>
+  :root { color-scheme: dark; --bg:#0b0b0f; --fg:#f2f2f5; --mute:#8a8a99; --accent:#7cf; --hot:#f6c; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100dvh; background:var(--bg); color:var(--fg);
+    font-family: system-ui, -apple-system, sans-serif; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:24px; padding:16px; text-align:center; }
+  #count { font-size: clamp(120px, 40vw, 320px); font-weight:800; line-height:1;
+    font-variant-numeric: tabular-nums; transition: transform .15s, color .15s; }
+  #count.bump { transform: scale(1.15); color: var(--hot); }
+  .label { color:var(--mute); letter-spacing:.2em; text-transform:uppercase; font-size:14px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; justify-content:center; }
+  button { font:inherit; font-size:18px; padding:14px 24px; border-radius:999px; border:1px solid #333;
+    background:#16161d; color:var(--fg); cursor:pointer; min-height:48px; }
+  button.primary { background:var(--accent); color:#000; border-color:var(--accent); font-weight:700; }
+  #live { min-height:3em; max-width:640px; color:var(--mute); font-size:16px; }
+  #status { font-size:13px; color:var(--mute); }
+  mark { background:var(--hot); color:#000; border-radius:4px; padding:0 3px; }
+</style>
+</head>
+<body>
+  <div class="label">Zmínek „AI"</div>
+  <div id="count" aria-live="polite">0</div>
+  <div class="row">
+    <button id="toggle" class="primary">Start</button>
+    <button id="plus" aria-label="Přičíst ručně">+1</button>
+    <button id="reset">Reset</button>
+  </div>
+  <div id="live"></div>
+  <div id="status"></div>
+<script>
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const $ = (id) => document.getElementById(id);
+// Czech recognizer spells "AI" many ways; match the spoken variants too.
+const RE = /(?<![\p{L}\d])(a\.?\s?i\.?|ej\s?aj|éj\s?aj|ej\s?ej|ajaj|ai)(?![\p{L}\d])/giu;
+
+let count = +localStorage.getItem('aicount') || 0;
+let running = false, rec = null, wakeLock = null;
+
+function render(bump) {
+  $('count').textContent = count;
+  localStorage.setItem('aicount', count);
+  if (bump) { $('count').classList.add('bump'); setTimeout(() => $('count').classList.remove('bump'), 200); }
+}
+const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[c]));
+const highlight = (t) => esc(t).replace(RE, '<mark>$&</mark>');
+
+function start() {
+  if (!SR) { $('status').textContent = 'Prohlížeč nepodporuje rozpoznávání řeči. Použij Chrome / Edge / Safari.'; return; }
+  rec = new SR();
+  rec.lang = 'cs-CZ';
+  rec.continuous = true;
+  rec.interimResults = true;
+  // Prefer on-device recognition so audio does not leave the machine (Chrome 139+).
+  if ('processLocally' in rec) rec.processLocally = true;
+
+  rec.onresult = (e) => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const t = e.results[i][0].transcript;
+      if (e.results[i].isFinal) {
+        const n = (t.match(RE) || []).length;
+        if (n) { count += n; render(true); }
+        $('live').innerHTML = highlight(t);
+      } else interim += t;
+    }
+    if (interim) $('live').innerHTML = highlight(interim);
+  };
+  rec.onerror = (e) => {
+    $('status').textContent = 'Chyba: ' + e.error;
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed' || e.error === 'language-not-supported') stop();
+  };
+  // Chrome ends the session after silence; restart while user wants it running.
+  rec.onend = () => { if (running) try { rec.start(); } catch {} };
+
+  running = true;
+  rec.start();
+  $('toggle').textContent = 'Stop';
+  $('status').textContent = 'Poslouchám…' + ('processLocally' in rec ? ' (on-device)' : '');
+  navigator.wakeLock?.request('screen').then((l) => (wakeLock = l)).catch(() => {});
+}
+
+function stop() {
+  running = false;
+  rec?.stop();
+  wakeLock?.release(); wakeLock = null;
+  $('toggle').textContent = 'Start';
+  $('status').textContent = 'Zastaveno';
+}
+
+$('toggle').onclick = () => (running ? stop() : start());
+$('plus').onclick = () => { count++; render(true); };
+$('reset').onclick = () => { count = 0; render(); };
+render();
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+</script>
+</body>
+</html>
