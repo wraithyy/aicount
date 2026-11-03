@@ -36,14 +36,17 @@
   </div>
   <div id="live"></div>
   <div id="status"></div>
-<script>
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+<script type="module">
+import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+
 const $ = (id) => document.getElementById(id);
-// Czech recognizer spells "AI" many ways; match the spoken variants too.
+// Whisper spells "AI" many ways in Czech; match the spoken variants too.
 const RE = /(?<![\p{L}\d])(a\.?\s?i\.?|ej\s?aj|éj\s?aj|ej\s?ej|ajaj|ai)(?![\p{L}\d])/giu;
+const RATE = 16000, CHUNK_S = 4, SILENCE_RMS = 0.01;
 
 let count = +localStorage.getItem('aicount') || 0;
-let running = false, rec = null, wakeLock = null;
+let running = false, asr = null, ctx = null, stream = null, wakeLock = null;
+let buf = [], busy = false, queue = [];
 
 function render(bump) {
   $('count').textContent = count;
@@ -51,49 +54,82 @@ function render(bump) {
   if (bump) { $('count').classList.add('bump'); setTimeout(() => $('count').classList.remove('bump'), 200); }
 }
 const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[c]));
-const highlight = (t) => esc(t).replace(RE, '<mark>$&</mark>');
+const status = (t) => ($('status').textContent = t);
 
-function start() {
-  if (!SR) { $('status').textContent = 'Prohlížeč nepodporuje rozpoznávání řeči. Použij Chrome / Edge / Safari.'; return; }
-  rec = new SR();
-  rec.lang = 'cs-CZ';
-  rec.continuous = true;
-  rec.interimResults = true;
-  // Prefer on-device recognition so audio does not leave the machine (Chrome 139+).
-  if ('processLocally' in rec) rec.processLocally = true;
+async function loadModel() {
+  if (asr) return asr;
+  const gpu = !!navigator.gpu;
+  status('Stahuji model (jednou, pak je v cache)…');
+  asr = await pipeline('automatic-speech-recognition', 'onnx-community/whisper-base', {
+    device: gpu ? 'webgpu' : 'wasm',
+    dtype: gpu ? { encoder_model: 'fp32', decoder_model_merged: 'q4' } : 'q8',
+    progress_callback: (p) => p.status === 'progress' && status(`Stahuji ${p.file}: ${Math.round(p.progress)} %`),
+  });
+  return asr;
+}
 
-  rec.onresult = (e) => {
-    let interim = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const t = e.results[i][0].transcript;
-      if (e.results[i].isFinal) {
-        const n = (t.match(RE) || []).length;
-        if (n) { count += n; render(true); }
-        $('live').innerHTML = highlight(t);
-      } else interim += t;
-    }
-    if (interim) $('live').innerHTML = highlight(interim);
-  };
-  rec.onerror = (e) => {
-    $('status').textContent = 'Chyba: ' + e.error;
-    if (e.error === 'not-allowed' || e.error === 'service-not-allowed' || e.error === 'language-not-supported') stop();
-  };
-  // Chrome ends the session after silence; restart while user wants it running.
-  rec.onend = () => { if (running) try { rec.start(); } catch {} };
+async function drain() {
+  if (busy) return;
+  busy = true;
+  while (queue.length) {
+    // ponytail: drops backlog when inference is slower than realtime; smaller model if that happens often
+    const audio = queue.length > 2 ? queue.splice(0).pop() : queue.shift();
+    const { text } = await asr(audio, { language: 'czech', task: 'transcribe' });
+    const n = (text.match(RE) || []).length;
+    if (n) { count += n; render(true); }
+    $('live').innerHTML = esc(text).replace(RE, '<mark>$&</mark>');
+  }
+  busy = false;
+}
 
-  running = true;
-  rec.start();
-  $('toggle').textContent = 'Stop';
-  $('status').textContent = 'Poslouchám…' + ('processLocally' in rec ? ' (on-device)' : '');
-  navigator.wakeLock?.request('screen').then((l) => (wakeLock = l)).catch(() => {});
+function onChunk(audio) {
+  let sum = 0;
+  for (const v of audio) sum += v * v;
+  // Whisper hallucinates text on silence, so skip quiet chunks.
+  if (Math.sqrt(sum / audio.length) < SILENCE_RMS) return;
+  queue.push(audio);
+  drain();
+}
+
+async function start() {
+  try {
+    $('toggle').disabled = true;
+    await loadModel();
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+    ctx = new AudioContext({ sampleRate: RATE });
+    const src = ctx.createMediaStreamSource(stream);
+    // ponytail: ScriptProcessor is deprecated but universal; AudioWorklet if it ever gets removed
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    let len = 0;
+    proc.onaudioprocess = (e) => {
+      const d = e.inputBuffer.getChannelData(0);
+      buf.push(new Float32Array(d)); len += d.length;
+      if (len >= RATE * CHUNK_S) {
+        const out = new Float32Array(len);
+        let o = 0; for (const b of buf) { out.set(b, o); o += b.length; }
+        buf = []; len = 0;
+        onChunk(out);
+      }
+    };
+    src.connect(proc); proc.connect(ctx.destination);
+    running = true;
+    $('toggle').textContent = 'Stop';
+    status('Poslouchám… (lokálně, ' + (navigator.gpu ? 'WebGPU' : 'WASM') + ')');
+    navigator.wakeLock?.request('screen').then((l) => (wakeLock = l)).catch(() => {});
+  } catch (e) {
+    status('Chyba: ' + e.message);
+  } finally {
+    $('toggle').disabled = false;
+  }
 }
 
 function stop() {
   running = false;
-  rec?.stop();
+  stream?.getTracks().forEach((t) => t.stop());
+  ctx?.close(); ctx = null; buf = [];
   wakeLock?.release(); wakeLock = null;
   $('toggle').textContent = 'Start';
-  $('status').textContent = 'Zastaveno';
+  status('Zastaveno');
 }
 
 $('toggle').onclick = () => (running ? stop() : start());
