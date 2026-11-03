@@ -146,18 +146,22 @@ const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&
 const status = (t) => ($('status').textContent = t);
 
 const modelSel = $('model');
+// iOS Safari gives tabs little memory and its WebGPU crashes on Whisper; use small WASM models there.
+const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const SAFE = IOS ? 'onnx-community/whisper-base' : 'onnx-community/whisper-small';
+if (IOS) modelSel.querySelector('[value*="turbo"]').remove();
 // A tab crash leaves the loading flag set; fall back to the safe model instead of crashing again.
 const crashed = localStorage.getItem('aimodel_loading');
 if (crashed) {
   localStorage.removeItem('aimodel_loading');
-  localStorage.setItem('aimodel', 'onnx-community/whisper-small');
+  localStorage.setItem('aimodel', SAFE);
 }
-modelSel.value = localStorage.getItem('aimodel') || 'onnx-community/whisper-small';
+modelSel.value = localStorage.getItem('aimodel') || SAFE;
 modelSel.onchange = () => { localStorage.setItem('aimodel', modelSel.value); asr = null; };
 
 async function loadModel() {
   if (asr) return asr;
-  const adapter = await navigator.gpu?.requestAdapter();
+  const adapter = IOS ? null : await navigator.gpu?.requestAdapter();
   const gpu = !!adapter, f16 = !!adapter?.features.has('shader-f16');
   const turbo = modelSel.value.includes('turbo');
   // Turbo in fp16 is ~1.6 GB; q4f16 keeps it ~560 MB with little accuracy loss.
@@ -260,7 +264,7 @@ $('toggle').onclick = () => (running ? stop() : start());
 $('plus').onclick = () => hit(1);
 $('reset').onclick = () => { count = 0; combo = 0; maxCombo = 0; localStorage.setItem('aimaxcombo', 0); $('combo').textContent = ''; render(); };
 render();
-if (crashed) status('Předchozí model shodil záložku, přepnuto na small.');
+if (crashed) status('Předchozí model shodil záložku, přepnuto na ' + SAFE.split('-').pop() + '.');
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
 </script>
