@@ -21,7 +21,10 @@
   button { font:inherit; font-size:18px; padding:14px 24px; border-radius:999px; border:1px solid #333;
     background:#16161d; color:var(--fg); cursor:pointer; min-height:48px; }
   button.primary { background:var(--accent); color:#000; border-color:var(--accent); font-weight:700; }
-  #live { min-height:3em; max-width:640px; color:var(--mute); font-size:16px; }
+  #log { width:min(92vw,640px); margin:0; padding-left:2em; text-align:left; color:var(--mute); font-size:15px; }
+  #log li:first-child { color:var(--fg); }
+  select { font:inherit; background:#16161d; color:var(--fg); border:1px solid #333; border-radius:8px; padding:6px; max-width:92vw; }
+  #modelrow { font-size:14px; color:var(--mute); }
   #status { font-size:13px; color:var(--mute); }
   mark { background:var(--hot); color:#000; border-radius:4px; padding:0 3px; }
   /* Pub-style beer mat tally: groups of five, fifth stroke crosses the four. */
@@ -58,19 +61,26 @@
     <button id="plus" aria-label="Přičíst ručně">+1</button>
     <button id="reset">Reset</button>
   </div>
-  <div id="live"></div>
+  <label id="modelrow">Model:
+    <select id="model">
+      <option value="onnx-community/whisper-large-v3-turbo">large-v3-turbo (nejpřesnější, ~560 MB, WebGPU)</option>
+      <option value="onnx-community/whisper-small">small (~250 MB)</option>
+      <option value="onnx-community/whisper-base">base (rychlý, méně přesný)</option>
+    </select>
+  </label>
+  <ol id="log" reversed></ol>
   <div id="status"></div>
 <script type="module">
 import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
 
 const $ = (id) => document.getElementById(id);
 // Whisper spells "AI" many ways in Czech; match the spoken variants too.
-const RE = /(?<![\p{L}\d])(a\.?\s?i\.?|ej\s?aj|éj\s?aj|ej\s?ej|ajaj|ai)(?![\p{L}\d])/giu;
-const RATE = 16000, CHUNK_S = 4, SILENCE_RMS = 0.01;
+const RE = /(?<![\p{L}\d])(a\.\s?i\.?|ai|[eé]j[\s,-]*[aá]j|ajaj)(?![\p{L}\d])/giu;
+const RATE = 16000, BLOCK = 2048, END_SILENCE_MS = 600, MAX_SEG_S = 12, MIN_SEG_S = 0.4;
 
 let count = +localStorage.getItem('aicount') || 0;
 let running = false, asr = null, ctx = null, stream = null, wakeLock = null;
-let buf = [], busy = false, queue = [];
+let busy = false, queue = [];
 
 const COMBO_WINDOW_MS = 20000, TALLY_MAX = 60;
 const COMBO_NAMES = ['', '', 'DOUBLE AI!', 'TRIPLE AI!', 'BUZZWORD OVERDRIVE', 'SYNERGIE!', 'DISRUPCE!',
@@ -135,38 +145,57 @@ function hit(n) {
 const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[c]));
 const status = (t) => ($('status').textContent = t);
 
+const modelSel = $('model');
+modelSel.value = localStorage.getItem('aimodel') || (navigator.gpu ? 'onnx-community/whisper-large-v3-turbo' : 'onnx-community/whisper-small');
+modelSel.onchange = () => { localStorage.setItem('aimodel', modelSel.value); asr = null; };
+
 async function loadModel() {
   if (asr) return asr;
-  const gpu = !!navigator.gpu;
+  const adapter = await navigator.gpu?.requestAdapter();
+  const gpu = !!adapter, f16 = !!adapter?.features.has('shader-f16');
+  const turbo = modelSel.value.includes('turbo');
+  // Turbo in fp16 is ~1.6 GB; q4f16 keeps it ~560 MB with little accuracy loss.
+  const dtype = !gpu ? 'q8'
+    : turbo ? (f16 ? { encoder_model: 'q4f16', decoder_model_merged: 'q4f16' } : { encoder_model: 'q4', decoder_model_merged: 'q4' })
+    : { encoder_model: f16 ? 'fp16' : 'fp32', decoder_model_merged: 'q4' };
   status('Stahuji model (jednou, pak je v cache)…');
-  asr = await pipeline('automatic-speech-recognition', 'onnx-community/whisper-base', {
+  asr = await pipeline('automatic-speech-recognition', modelSel.value, {
     device: gpu ? 'webgpu' : 'wasm',
-    dtype: gpu ? { encoder_model: 'fp32', decoder_model_merged: 'q4' } : 'q8',
+    dtype,
     progress_callback: (p) => p.status === 'progress' && status(`Stahuji ${p.file}: ${Math.round(p.progress)} %`),
   });
   return asr;
+}
+
+function logLine(text) {
+  const li = document.createElement('li');
+  li.innerHTML = esc(text).replace(RE, '<mark>$&</mark>');
+  $('log').prepend(li);
+  while ($('log').children.length > 8) $('log').lastChild.remove();
 }
 
 async function drain() {
   if (busy) return;
   busy = true;
   while (queue.length) {
-    // ponytail: drops backlog when inference is slower than realtime; smaller model if that happens often
-    const audio = queue.length > 2 ? queue.splice(0).pop() : queue.shift();
+    const audio = queue.shift();
+    status(`Přepisuji… (fronta ${queue.length})`);
     const { text } = await asr(audio, { language: 'czech', task: 'transcribe' });
-    const n = (text.match(RE) || []).length;
+    const t = text.trim();
+    if (!t) continue;
+    const n = (t.match(RE) || []).length;
     if (n) hit(n);
-    $('live').innerHTML = esc(text).replace(RE, '<mark>$&</mark>');
+    logLine(t);
   }
+  if (running) status('Poslouchám… (lokálně)');
   busy = false;
 }
 
-function onChunk(audio) {
-  let sum = 0;
-  for (const v of audio) sum += v * v;
-  // Whisper hallucinates text on silence, so skip quiet chunks.
-  if (Math.sqrt(sum / audio.length) < SILENCE_RMS) return;
-  queue.push(audio);
+function onSegment(blocks) {
+  const out = new Float32Array(blocks.reduce((a, b) => a + b.length, 0));
+  let o = 0; for (const b of blocks) { out.set(b, o); o += b.length; }
+  if (out.length < RATE * MIN_SEG_S) return;
+  queue.push(out);
   drain();
 }
 
@@ -174,21 +203,29 @@ async function start() {
   try {
     $('toggle').disabled = true;
     await loadModel();
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: false, autoGainControl: true } });
     ctx = new AudioContext({ sampleRate: RATE });
     const src = ctx.createMediaStreamSource(stream);
     // ponytail: ScriptProcessor is deprecated but universal; AudioWorklet if it ever gets removed
-    const proc = ctx.createScriptProcessor(4096, 1, 1);
-    let len = 0;
+    const proc = ctx.createScriptProcessor(BLOCK, 1, 1);
+    // Energy VAD: cut segments at pauses so words are never split mid-way and Whisper gets whole phrases.
+    let seg = [], prev = null, silentMs = 0, noise = 0.005;
+    const blockMs = (BLOCK / RATE) * 1000;
     proc.onaudioprocess = (e) => {
-      const d = e.inputBuffer.getChannelData(0);
-      buf.push(new Float32Array(d)); len += d.length;
-      if (len >= RATE * CHUNK_S) {
-        const out = new Float32Array(len);
-        let o = 0; for (const b of buf) { out.set(b, o); o += b.length; }
-        buf = []; len = 0;
-        onChunk(out);
+      const d = new Float32Array(e.inputBuffer.getChannelData(0));
+      let sum = 0; for (const v of d) sum += v * v;
+      const rms = Math.sqrt(sum / d.length);
+      const speech = rms > Math.max(0.006, noise * 3);
+      if (!speech) noise = noise * 0.95 + rms * 0.05;
+      if (speech) {
+        if (!seg.length && prev) seg.push(prev); // pre-roll keeps the word onset
+        seg.push(d); silentMs = 0;
+      } else if (seg.length) {
+        seg.push(d); silentMs += blockMs;
+        if (silentMs >= END_SILENCE_MS) { onSegment(seg); seg = []; }
       }
+      if (seg.length * BLOCK >= RATE * MAX_SEG_S) { onSegment(seg); seg = []; }
+      prev = d;
     };
     src.connect(proc); proc.connect(ctx.destination);
     running = true;
@@ -205,7 +242,7 @@ async function start() {
 function stop() {
   running = false;
   stream?.getTracks().forEach((t) => t.stop());
-  ctx?.close(); ctx = null; buf = [];
+  ctx?.close(); ctx = null;
   wakeLock?.release(); wakeLock = null;
   $('toggle').textContent = 'Start';
   status('Zastaveno');
